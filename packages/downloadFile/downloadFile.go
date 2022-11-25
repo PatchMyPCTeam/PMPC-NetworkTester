@@ -8,7 +8,7 @@ import (
 	"path"
 )
 
-func DownloadFile(url string) error {
+func DownloadFile(url string) (string, error) {
 	resp, err := http.Get(url)
 	filename := path.Base(resp.Request.URL.Path)
 	out, _ := os.Create(filename)
@@ -19,6 +19,7 @@ func DownloadFile(url string) error {
 	if resp != nil {
 		defer resp.Body.Close()
 		io.Copy(out, resp.Body)
+		return filename, nil
 	}
-	return err
+	return "no file name", err
 }

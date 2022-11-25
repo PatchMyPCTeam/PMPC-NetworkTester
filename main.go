@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/PMPC-NetworkTester/packages/downloadFile"
-	"github.com/PMPC-NetworkTester/packages/goCMTrace"
+	"github.com/PatchMyPCTeam/PMPC-NetworkTester/packages/downloadFile"
+	"github.com/PatchMyPCTeam/PMPC-NetworkTester/packages/goCMTrace"
 )
 
 func connectionTest(connection connectionInfo, wg *sync.WaitGroup) connectionResult {
@@ -105,8 +105,11 @@ func main() {
 	}
 	state := connectionTest(connectionObj, &wg)
 	if state.result == "Success" {
-		fileName := downloadFile.DownloadFile("https://patchmypc.com/scupcatalog/downloads/PatchMyPC-DomainList.csv")
-		records, err := readData(fileName.)
+		fileName, err := downloadFile.DownloadFile("https://patchmypc.com/scupcatalog/downloads/PatchMyPC-DomainList.csv")
+		if err != nil {
+			log.Fatal(err)
+		}
+		records, err := readData(fileName)
 		if err != nil {
 			log.Fatal(err)
 		}
