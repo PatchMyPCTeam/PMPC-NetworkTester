@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/csv"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -95,6 +96,16 @@ type connectionResult struct {
 }
 
 func main() {
+	// Parse command line flags
+	guiMode := flag.Bool("gui", false, "Run in GUI mode")
+	flag.Parse()
+
+	if *guiMode {
+		runGUI()
+		return
+	}
+
+	// Original CLI mode
 	var wg sync.WaitGroup
 	wg.Add(1)
 	connectionObj := connectionInfo{
