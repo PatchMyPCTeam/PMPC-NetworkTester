@@ -1,1 +1,0 @@
-<![LOG[Failed test for Product: Patch My PC Network Tester to connnect to: patchmypc.com 443 due to dial tcp: lookup patchmypc.com on 127.0.0.53:53: server misbehaving]LOG]!><time="18:35:58.858607" date="09-24-2025" component="main.connectionTest" context="/home/runner/work/PMPC-NetworkTester/PMPC-NetworkTester/main.go" type="3" thread="50" file=PMPC-NetworkTester.log"">
