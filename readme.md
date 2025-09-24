@@ -1,5 +1,36 @@
 # Patch My PC Network Tester
 
+A network connectivity testing tool for Patch My PC services with both GUI and CLI interfaces.
+
+## Features
+
+- **Graphical User Interface (GUI)**: Default mode with an intuitive interface
+- **Dark Mode Support**: Toggle between light and dark themes
+- **Command Line Interface (CLI)**: Available via `/nogui` flag
+- **Real-time Testing**: Live progress updates and results display
+- **Network Connectivity Testing**: Tests connections to Patch My PC services and domains
+
+## Usage
+
+### GUI Mode (Default)
+Run the application without any arguments to launch the graphical interface:
+```
+PMPC-NetworkTester
+```
+
+The GUI includes:
+- Dark/Light mode toggle
+- Start Network Test button
+- Progress bar with status updates
+- Real-time results list
+- All testing runs within the application window
+
+### CLI Mode
+Run with the `/nogui` flag for command-line operation:
+```
+PMPC-NetworkTester /nogui
+```
+
 ## DISCLAIMER
 
 The information contained in this online site is presented for general educational and information purposes only. The information contained in this site should not be considered exhaustive and the user should seek the advice of appropriate professionals.
@@ -10,6 +41,18 @@ Patch My PC provides scripts, macro, and other code examples for illustration on
 
 ## Compile Instructions Windows
 
+For GUI version:
+```go
+go build -o PMPC-NetworkTester.exe
+```
+
+For Windows GUI without console window:
 ```go
 go build -o PMPC-NetworkTester.exe -ldflags -H=windowsgui
 ```
+
+## Dependencies
+
+- Go 1.19+
+- Fyne v2 (for GUI functionality)
+- Platform-specific GUI libraries (automatically handled by Fyne)
