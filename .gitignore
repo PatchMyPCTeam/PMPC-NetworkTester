@@ -1,1 +1,5 @@
 .DS_Store
+PMPC-NetworkTester
+PMPC-NetworkTester.exe
+*.log
+*.csv
