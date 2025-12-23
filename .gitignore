@@ -1,1 +1,11 @@
 .DS_Store
+
+# Build artifacts
+*.exe
+!*.exe.manifest
+
+# Log files
+*.log
+
+# Downloaded test data
+PatchMyPC-DomainList.csv
