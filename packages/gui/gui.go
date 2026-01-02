@@ -106,6 +106,11 @@ const (
 	TIMER_ID       = 1
 	TIMER_INTERVAL = 100
 
+	// Summary window control IDs
+	ID_SUMMARY_LISTBOX = 2001
+	ID_SUMMARY_CLOSE   = 2002
+	ID_SUMMARY_COPY    = 2003
+
 	MAX_CONCURRENT = 20
 
 	// Color palette (BGR format for Windows)
@@ -142,6 +147,7 @@ var (
 	procSetTimer             = user32.NewProc("SetTimer")
 	procKillTimer            = user32.NewProc("KillTimer")
 	procMoveWindow           = user32.NewProc("MoveWindow")
+	procGetClientRect        = user32.NewProc("GetClientRect")
 	procGetModuleHandleW     = kernel32.NewProc("GetModuleHandleW")
 	procCreateSolidBrush     = gdi32.NewProc("CreateSolidBrush")
 	procSetTextColor         = gdi32.NewProc("SetTextColor")
@@ -154,6 +160,15 @@ var (
 	procDrawTextW            = user32.NewProc("DrawTextW")
 	procFrameRect            = user32.NewProc("FrameRect")
 	procInflateRect          = user32.NewProc("InflateRect")
+	procDestroyWindow        = user32.NewProc("DestroyWindow")
+	procMessageBoxW          = user32.NewProc("MessageBoxW")
+	procOpenClipboard        = user32.NewProc("OpenClipboard")
+	procCloseClipboard       = user32.NewProc("CloseClipboard")
+	procEmptyClipboard       = user32.NewProc("EmptyClipboard")
+	procSetClipboardData     = user32.NewProc("SetClipboardData")
+	procGlobalAlloc          = kernel32.NewProc("GlobalAlloc")
+	procGlobalLock           = kernel32.NewProc("GlobalLock")
+	procGlobalUnlock         = kernel32.NewProc("GlobalUnlock")
 	procInitCommonControlsEx = comctl32.NewProc("InitCommonControlsEx")
 )
 
@@ -219,6 +234,25 @@ type ConnectionInfo struct {
 	Reason     string // Description of why this connection is needed
 }
 
+// SummaryWindow displays failed connections after tests complete
+type SummaryWindow struct {
+	hwnd        syscall.Handle
+	listBox     syscall.Handle
+	btnCopy     syscall.Handle
+	btnClose    syscall.Handle
+	hFont       syscall.Handle
+	darkBrush   uintptr
+	accentBrush uintptr
+	hoverBrush  uintptr
+	failedItems []string
+	parentGUI   *NetworkTesterGUI
+	// Pre-allocated button text
+	strCopy  *uint16
+	strClose *uint16
+}
+
+var globalSummary *SummaryWindow
+
 // NetworkTesterGUI is the main GUI controller for the network tester application.
 // It manages the Windows GUI controls, handles user interaction, and coordinates
 // the concurrent network tests.
@@ -245,8 +279,9 @@ type NetworkTesterGUI struct {
 	testsDone int32
 
 	// Thread-safe result queue
-	resultsMu sync.Mutex
-	results   []string
+	resultsMu     sync.Mutex
+	results       []string
+	failedResults []string // Store failed results for summary window
 
 	// Atomic counters
 	totalTests     int32
@@ -783,12 +818,20 @@ func (g *NetworkTesterGUI) onTestsComplete() {
 	// Reset button using pre-allocated string
 	if g.btnStart != 0 {
 		g.currentBtnText = g.strRunAgain
-		procEnableWindow.Call(uintptr(g.btnStart), 1)
+		// Only enable button if there are no failures (no summary window will be shown)
+		if fail == 0 {
+			procEnableWindow.Call(uintptr(g.btnStart), 1)
+		}
 		// Force redraw
 		procSendMessageW.Call(uintptr(g.btnStart), 0x000F, 0, 0) // WM_PAINT via InvalidateRect
 	}
 
 	logInfo("onTestsComplete finished")
+
+	// Show summary window if there were failures
+	if fail > 0 {
+		g.showSummaryWindow()
+	}
 }
 
 func (g *NetworkTesterGUI) startTests() {
@@ -817,6 +860,7 @@ func (g *NetworkTesterGUI) startTests() {
 
 	g.resultsMu.Lock()
 	g.results = nil
+	g.failedResults = nil
 	g.resultsMu.Unlock()
 
 	if g.lblStatus != 0 {
@@ -833,6 +877,10 @@ func (g *NetworkTesterGUI) startTests() {
 func (g *NetworkTesterGUI) queueResult(text string) {
 	g.resultsMu.Lock()
 	g.results = append(g.results, text)
+	// Track failed results for summary window
+	if len(text) >= 6 && text[:6] == "[FAIL]" {
+		g.failedResults = append(g.failedResults, text)
+	}
 	g.resultsMu.Unlock()
 }
 
@@ -986,4 +1034,398 @@ func (g *NetworkTesterGUI) readData(fileName string) ([][]string, error) {
 	r := csv.NewReader(f)
 	r.Read() // skip header
 	return r.ReadAll()
+}
+
+// ============================================================================
+// Summary Window Implementation
+// ============================================================================
+
+// summaryWndProc handles messages for the summary window
+func summaryWndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
+	if globalSummary == nil {
+		ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), uintptr(msg), wParam, lParam)
+		return ret
+	}
+
+	switch msg {
+	case WM_COMMAND:
+		ctrlID := int(wParam & 0xFFFF)
+		notifyCode := int((wParam >> 16) & 0xFFFF)
+
+		if notifyCode == BN_CLICKED {
+			if ctrlID == ID_SUMMARY_CLOSE {
+				procDestroyWindow.Call(uintptr(hwnd))
+				globalSummary = nil
+				return 0
+			}
+			if ctrlID == ID_SUMMARY_COPY {
+				globalSummary.copyToClipboard()
+				return 0
+			}
+		}
+		ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), uintptr(msg), wParam, lParam)
+		return ret
+
+	case WM_CTLCOLORSTATIC:
+		if globalSummary.darkBrush != 0 {
+			procSetTextColor.Call(wParam, COLOR_WHITE)
+			procSetBkMode.Call(wParam, TRANSPARENT)
+			return globalSummary.darkBrush
+		}
+		ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), uintptr(msg), wParam, lParam)
+		return ret
+
+	case WM_CTLCOLORLISTBOX:
+		if globalSummary.darkBrush != 0 {
+			procSetTextColor.Call(wParam, COLOR_ERROR)
+			procSetBkColor.Call(wParam, COLOR_DARK)
+			return globalSummary.darkBrush
+		}
+		ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), uintptr(msg), wParam, lParam)
+		return ret
+
+	case WM_DRAWITEM:
+		dis := (*DRAWITEMSTRUCT)(unsafe.Pointer(lParam))
+		if dis != nil {
+			if dis.CtlID == ID_SUMMARY_LISTBOX {
+				globalSummary.drawListItem(dis)
+				return 1
+			}
+			if dis.CtlID == ID_SUMMARY_COPY || dis.CtlID == ID_SUMMARY_CLOSE {
+				globalSummary.drawButton(dis)
+				return 1
+			}
+		}
+		ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), uintptr(msg), wParam, lParam)
+		return ret
+
+	case WM_MEASUREITEM:
+		mis := (*MEASUREITEMSTRUCT)(unsafe.Pointer(lParam))
+		if mis != nil && mis.CtlID == ID_SUMMARY_LISTBOX {
+			mis.ItemHeight = 24
+			return 1
+		}
+		ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), uintptr(msg), wParam, lParam)
+		return ret
+
+	case WM_SIZE:
+		if globalSummary != nil {
+			width := int(lParam & 0xFFFF)
+			height := int((lParam >> 16) & 0xFFFF)
+			globalSummary.onResize(width, height)
+		}
+		return 0
+
+	case WM_CLOSE, WM_DESTROY:
+		// Re-enable the Run Again button on the parent window
+		if globalSummary != nil && globalSummary.parentGUI != nil {
+			if globalSummary.parentGUI.btnStart != 0 {
+				procEnableWindow.Call(uintptr(globalSummary.parentGUI.btnStart), 1)
+			}
+		}
+		globalSummary = nil
+		procDestroyWindow.Call(uintptr(hwnd))
+		return 0
+
+	default:
+		ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), uintptr(msg), wParam, lParam)
+		return ret
+	}
+}
+
+// drawListItem draws an item in the summary listbox (all items are failures, shown in red)
+func (s *SummaryWindow) drawListItem(dis *DRAWITEMSTRUCT) {
+	if dis == nil || s == nil {
+		return
+	}
+
+	if dis.ItemID == 0xFFFFFFFF {
+		return
+	}
+
+	hdc := dis.HDC
+	rc := dis.RcItem
+
+	// Get the text for this item
+	textLen, _, _ := procSendMessageW.Call(uintptr(s.listBox), LB_GETTEXTLEN, uintptr(dis.ItemID), 0)
+	if textLen == 0 || int32(textLen) < 0 {
+		return
+	}
+
+	// Allocate buffer and get text
+	buf := make([]uint16, textLen+1)
+	procSendMessageW.Call(uintptr(s.listBox), LB_GETTEXT, uintptr(dis.ItemID), uintptr(unsafe.Pointer(&buf[0])))
+
+	// Fill background with dark color
+	procFillRect.Call(uintptr(hdc), uintptr(unsafe.Pointer(&rc)), s.darkBrush)
+
+	// All items in summary are failures - use error color (red)
+	procSetTextColor.Call(uintptr(hdc), COLOR_ERROR)
+	procSetBkMode.Call(uintptr(hdc), TRANSPARENT)
+
+	// Select font
+	procSelectObject.Call(uintptr(hdc), uintptr(s.hFont))
+
+	// Add left padding
+	rc.Left += 4
+
+	// Draw text
+	procDrawTextW.Call(uintptr(hdc), uintptr(unsafe.Pointer(&buf[0])), uintptr(textLen),
+		uintptr(unsafe.Pointer(&rc)), DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX)
+}
+
+// drawButton draws an owner-drawn button in the summary window
+func (s *SummaryWindow) drawButton(dis *DRAWITEMSTRUCT) {
+	if dis == nil || s == nil {
+		return
+	}
+
+	hdc := dis.HDC
+	rc := dis.RcItem
+
+	// Determine colors based on state
+	var bgBrush uintptr
+	var textColor uintptr = COLOR_WHITE
+
+	if dis.ItemState&ODS_DISABLED != 0 {
+		bgBrush = s.darkBrush
+		textColor = COLOR_DISABLED
+	} else if dis.ItemState&ODS_SELECTED != 0 {
+		bgBrush = s.hoverBrush
+	} else {
+		bgBrush = s.accentBrush
+	}
+
+	// Fill background
+	procFillRect.Call(uintptr(hdc), uintptr(unsafe.Pointer(&rc)), bgBrush)
+
+	// Set text properties
+	procSetBkMode.Call(uintptr(hdc), TRANSPARENT)
+	procSetTextColor.Call(uintptr(hdc), textColor)
+	procSelectObject.Call(uintptr(hdc), uintptr(s.hFont))
+
+	// Get button text
+	var text *uint16
+	if dis.CtlID == ID_SUMMARY_COPY {
+		text = s.strCopy
+	} else {
+		text = s.strClose
+	}
+
+	// Calculate text length
+	textLen := 0
+	for p := text; *p != 0; p = (*uint16)(unsafe.Pointer(uintptr(unsafe.Pointer(p)) + 2)) {
+		textLen++
+	}
+
+	// Draw centered text
+	procDrawTextW.Call(uintptr(hdc), uintptr(unsafe.Pointer(text)), uintptr(textLen),
+		uintptr(unsafe.Pointer(&rc)), DT_CENTER|DT_VCENTER|DT_SINGLELINE)
+}
+
+// onResize handles resizing of the summary window
+func (s *SummaryWindow) onResize(width, height int) {
+	if s == nil {
+		return
+	}
+
+	margin := 20
+	btnWidth := 100
+	btnHeight := 35
+	btnMargin := 20
+	listboxTop := 45
+
+	// Resize listbox to fill available space (leave room for buttons at bottom)
+	if s.listBox != 0 {
+		newWidth := width - (margin * 2)
+		newHeight := height - listboxTop - btnHeight - (margin * 2) - 10
+		if newWidth > 0 && newHeight > 0 {
+			procMoveWindow.Call(uintptr(s.listBox), uintptr(margin), uintptr(listboxTop),
+				uintptr(newWidth), uintptr(newHeight), 1)
+		}
+	}
+
+	// Position Copy button at bottom-left
+	if s.btnCopy != 0 {
+		btnY := height - btnHeight - btnMargin
+		procMoveWindow.Call(uintptr(s.btnCopy), uintptr(margin), uintptr(btnY),
+			uintptr(btnWidth), uintptr(btnHeight), 1)
+	}
+
+	// Position Close button at bottom-right
+	if s.btnClose != 0 {
+		btnX := width - btnWidth - margin
+		btnY := height - btnHeight - btnMargin
+		procMoveWindow.Call(uintptr(s.btnClose), uintptr(btnX), uintptr(btnY),
+			uintptr(btnWidth), uintptr(btnHeight), 1)
+	}
+}
+
+// copyToClipboard copies the failed connection list to the clipboard
+func (s *SummaryWindow) copyToClipboard() {
+	logInfo("Copying failed connections to clipboard")
+
+	if len(s.failedItems) == 0 {
+		return
+	}
+
+	// Build text from failed items
+	var fullText string
+	for _, item := range s.failedItems {
+		fullText += item + "\r\n"
+	}
+
+	// Convert to UTF16 for Windows clipboard
+	utf16Text, _ := syscall.UTF16FromString(fullText)
+
+	// Calculate size in bytes
+	size := len(utf16Text) * 2
+
+	// Allocate global memory (GMEM_MOVEABLE = 0x0002)
+	hMem, _, _ := procGlobalAlloc.Call(0x0002, uintptr(size))
+	if hMem == 0 {
+		logError("Failed to allocate global memory for clipboard")
+		return
+	}
+
+	// Lock memory and copy data
+	pMem, _, _ := procGlobalLock.Call(hMem)
+	if pMem == 0 {
+		logError("Failed to lock global memory")
+		return
+	}
+
+	// Copy UTF16 data
+	for i, ch := range utf16Text {
+		*(*uint16)(unsafe.Pointer(pMem + uintptr(i*2))) = ch
+	}
+
+	procGlobalUnlock.Call(hMem)
+
+	// Open clipboard and set data
+	ret, _, _ := procOpenClipboard.Call(uintptr(s.hwnd))
+	if ret == 0 {
+		logError("Failed to open clipboard")
+		return
+	}
+
+	procEmptyClipboard.Call()
+	// CF_UNICODETEXT = 13
+	procSetClipboardData.Call(13, hMem)
+	procCloseClipboard.Call()
+
+	logInfo(fmt.Sprintf("Copied %d failed items to clipboard", len(s.failedItems)))
+
+	// Show confirmation
+	msg, _ := syscall.UTF16PtrFromString(fmt.Sprintf("Copied %d failed connections to clipboard.", len(s.failedItems)))
+	title, _ := syscall.UTF16PtrFromString("Copied")
+	procMessageBoxW.Call(uintptr(s.hwnd), uintptr(unsafe.Pointer(msg)), uintptr(unsafe.Pointer(title)), 0x40) // MB_ICONINFORMATION
+}
+
+// showSummaryWindow creates and displays the summary window with failed connections
+func (g *NetworkTesterGUI) showSummaryWindow() {
+	logInfo("Creating summary window")
+
+	g.resultsMu.Lock()
+	failedItems := make([]string, len(g.failedResults))
+	copy(failedItems, g.failedResults)
+	g.resultsMu.Unlock()
+
+	if len(failedItems) == 0 {
+		logInfo("No failures to show in summary")
+		return
+	}
+
+	// Register summary window class
+	summaryClassName, _ := syscall.UTF16PtrFromString("PMPCNetworkTesterSummary")
+	cur, _, _ := procLoadCursorW.Call(0, IDC_ARROW)
+
+	wc := WNDCLASSEXW{
+		Size:       uint32(unsafe.Sizeof(WNDCLASSEXW{})),
+		Style:      0,
+		WndProc:    syscall.NewCallback(summaryWndProc),
+		Instance:   g.hInstance,
+		Icon:       g.hIcon,
+		Cursor:     syscall.Handle(cur),
+		Background: syscall.Handle(g.darkBrush),
+		ClassName:  summaryClassName,
+		IconSm:     g.hIcon,
+	}
+	procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
+
+	// Create summary window
+	windowTitle, _ := syscall.UTF16PtrFromString(fmt.Sprintf("Failed Connections (%d)", len(failedItems)))
+	hwnd, _, _ := procCreateWindowExW.Call(0,
+		uintptr(unsafe.Pointer(summaryClassName)),
+		uintptr(unsafe.Pointer(windowTitle)),
+		WS_OVERLAPPEDWINDOW,
+		150, 150, 750, 550,
+		uintptr(g.hwnd), 0, uintptr(g.hInstance), 0)
+
+	globalSummary = &SummaryWindow{
+		hwnd:        syscall.Handle(hwnd),
+		hFont:       g.hFont,
+		darkBrush:   g.darkBrush,
+		accentBrush: g.accentBrush,
+		hoverBrush:  g.hoverBrush,
+		failedItems: failedItems,
+		parentGUI:   g,
+	}
+
+	// Pre-allocate button text
+	globalSummary.strCopy, _ = syscall.UTF16PtrFromString("Copy")
+	globalSummary.strClose, _ = syscall.UTF16PtrFromString("Close")
+
+	// Create title label
+	staticClass, _ := syscall.UTF16PtrFromString("STATIC")
+	titleText, _ := syscall.UTF16PtrFromString(fmt.Sprintf("The following %d connections failed:", len(failedItems)))
+	procCreateWindowExW.Call(0, uintptr(unsafe.Pointer(staticClass)), uintptr(unsafe.Pointer(titleText)),
+		WS_CHILD|WS_VISIBLE|SS_LEFT, 20, 15, 700, 25,
+		uintptr(globalSummary.hwnd), 0, uintptr(g.hInstance), 0)
+
+	// Create owner-drawn listbox for failed connections
+	listboxClass, _ := syscall.UTF16PtrFromString("LISTBOX")
+	lb, _, _ := procCreateWindowExW.Call(WS_EX_CLIENTEDGE, uintptr(unsafe.Pointer(listboxClass)), 0,
+		WS_CHILD|WS_VISIBLE|WS_BORDER|WS_VSCROLL|WS_HSCROLL|LBS_HASSTRINGS|LBS_NOSEL|LBS_NOINTEGRALHEIGHT|LBS_OWNERDRAWFIXED,
+		20, 45, 690, 350,
+		uintptr(globalSummary.hwnd), ID_SUMMARY_LISTBOX, uintptr(g.hInstance), 0)
+	globalSummary.listBox = syscall.Handle(lb)
+	procSendMessageW.Call(uintptr(globalSummary.listBox), WM_SETFONT, uintptr(g.hFont), 1)
+	procSendMessageW.Call(uintptr(globalSummary.listBox), LB_SETITEMHEIGHT, 0, 24)
+
+	// Add failed items to listbox
+	for _, item := range failedItems {
+		text, _ := syscall.UTF16PtrFromString(item)
+		procSendMessageW.Call(uintptr(globalSummary.listBox), LB_ADDSTRING, 0, uintptr(unsafe.Pointer(text)))
+	}
+
+	// Create buttons (owner-drawn style matching main window)
+	buttonClass, _ := syscall.UTF16PtrFromString("BUTTON")
+
+	// Copy button (bottom-left) - owner-drawn
+	copyText, _ := syscall.UTF16PtrFromString("Copy")
+	copyBtn, _, _ := procCreateWindowExW.Call(0, uintptr(unsafe.Pointer(buttonClass)), uintptr(unsafe.Pointer(copyText)),
+		WS_CHILD|WS_VISIBLE|BS_OWNERDRAW|WS_TABSTOP, 20, 410, 100, 35,
+		uintptr(globalSummary.hwnd), ID_SUMMARY_COPY, uintptr(g.hInstance), 0)
+	globalSummary.btnCopy = syscall.Handle(copyBtn)
+	procSendMessageW.Call(copyBtn, WM_SETFONT, uintptr(g.hFont), 1)
+
+	// Close button (bottom-right) - owner-drawn
+	closeText, _ := syscall.UTF16PtrFromString("Close")
+	closeBtn, _, _ := procCreateWindowExW.Call(0, uintptr(unsafe.Pointer(buttonClass)), uintptr(unsafe.Pointer(closeText)),
+		WS_CHILD|WS_VISIBLE|BS_OWNERDRAW|WS_TABSTOP, 630, 410, 100, 35,
+		uintptr(globalSummary.hwnd), ID_SUMMARY_CLOSE, uintptr(g.hInstance), 0)
+	globalSummary.btnClose = syscall.Handle(closeBtn)
+	procSendMessageW.Call(closeBtn, WM_SETFONT, uintptr(g.hFont), 1)
+
+	// Show the summary window
+	procShowWindow.Call(uintptr(globalSummary.hwnd), SW_SHOWNORMAL)
+	procUpdateWindow.Call(uintptr(globalSummary.hwnd))
+
+	// Get actual client area dimensions and trigger initial resize
+	var clientRect RECT
+	procGetClientRect.Call(uintptr(globalSummary.hwnd), uintptr(unsafe.Pointer(&clientRect)))
+	globalSummary.onResize(int(clientRect.Right), int(clientRect.Bottom))
+
+	logInfo(fmt.Sprintf("Summary window created with %d failed items", len(failedItems)))
 }
